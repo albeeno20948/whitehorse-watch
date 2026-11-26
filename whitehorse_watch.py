@@ -3,18 +3,20 @@
 White Horse Hill watcher: a small Campnab-style availability tracker for DOC NZ.
 
 It checks DOC's booking system for the night(s) you still need at White Horse Hill
-Campsite (Aoraki/Mount Cook) and sends a push notification to your phone (through
-the free ntfy app) as soon as one opens up.
+Campsite (Aoraki/Mount Cook) and sends an alert to your phone as soon as one opens
+up: through a Telegram bot, the ntfy app, or both.
 
 Standard library only: needs Python 3.8+ and nothing else.
 
-    python3 whitehorse_watch.py --check                  # show availability around your dates, no alerts
-    python3 whitehorse_watch.py --test-notify --topic T  # send a test push to your phone
-    python3 whitehorse_watch.py --loop --topic T         # keep checking every ~5 minutes (laptop)
-    python3 whitehorse_watch.py --topic T                # check once (what GitHub Actions runs)
+    python3 whitehorse_watch.py --check            # show availability around your dates, no alerts
+    python3 whitehorse_watch.py --telegram-setup   # find your Telegram chat ID (after messaging your bot)
+    python3 whitehorse_watch.py --test-notify      # send a test alert to your phone
+    python3 whitehorse_watch.py --loop             # keep checking every ~5 minutes (laptop)
+    python3 whitehorse_watch.py                    # check once (what GitHub Actions runs)
 
-Settings can also come from environment variables: NTFY_TOPIC, WANTED_NIGHTS,
-MIN_PEOPLE, FACILITY_ID, BOOKING_URL.
+Settings come from environment variables (or the matching --options):
+TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NTFY_TOPIC, WANTED_NIGHTS, MIN_PEOPLE,
+FACILITY_ID, BOOKING_URL.
 """
 
 import argparse
@@ -59,6 +61,7 @@ API_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
+TELEGRAM_API = os.environ.get("TELEGRAM_API", "https://api.telegram.org")
 
 MIN_INTERVAL_MIN = 2      # be polite to DOC: never poll faster than this
 ERROR_ALERT_AFTER = 3     # failed checks in a row before you get a "tracker broken" push
@@ -181,15 +184,44 @@ def desktop_alert(title, message):
         print(f"  (desktop alert failed: {e})")
 
 
-def push(args, title, message, priority=5, tags=None):
-    """Sends a push through ntfy. Returns True if it went out (or nothing was configured)."""
-    print(f"\n>>> {title}\n    {message.replace(chr(10), chr(10) + '    ')}\n")
-    if args.desktop:
-        desktop_alert(title, message.split("\n")[0])
-    if not args.topic:
-        print("  (no ntfy topic set, so no phone push)")
-        return True
+def post_json(url, payload, timeout=20):
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as res:
+        return res.read()
 
+
+def telegram_configured(args):
+    return bool(args.telegram_token and args.telegram_chat)
+
+
+def send_telegram(args, title, message, priority):
+    payload = {
+        "chat_id": args.telegram_chat,
+        "text": f"{title}\n\n{message}",
+        "disable_web_page_preview": True,
+        # Low-priority news ("gone again", "working again") arrives silently.
+        "disable_notification": priority <= 2,
+        "reply_markup": {"inline_keyboard": [[{"text": "Open DOC booking", "url": BOOKING_URL}]]},
+    }
+    try:
+        post_json(f"{TELEGRAM_API}/bot{args.telegram_token}/sendMessage", payload)
+        print("  sent to Telegram")
+        return True
+    except urllib.error.HTTPError as e:
+        # Never print the URL: it contains the bot token.
+        detail = e.read().decode("utf-8", errors="replace")[:200]
+        print(f"  !! Telegram refused the message: HTTP {e.code} {detail}")
+    except Exception as e:
+        print(f"  !! Telegram failed: {type(e).__name__}")
+    return False
+
+
+def send_ntfy(args, title, message, priority, tags):
     payload = {
         "topic": args.topic,
         "title": title,
@@ -199,20 +231,75 @@ def push(args, title, message, priority=5, tags=None):
         "click": BOOKING_URL,
         "actions": [{"action": "view", "label": "Open DOC booking", "url": BOOKING_URL}],
     }
-    req = urllib.request.Request(
-        NTFY_SERVER.rstrip("/") + "/",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=20) as res:
-            res.read()
-        print("  push sent to your phone")
+        post_json(NTFY_SERVER.rstrip("/") + "/", payload)
+        print("  sent to ntfy")
         return True
     except Exception as e:
-        print(f"  !! push failed: {e}")
+        print(f"  !! ntfy push failed: {e}")
         return False
+
+
+def push(args, title, message, priority=5, tags=None):
+    """Sends the alert to every channel that is set up. Returns True if at least one
+    channel delivered it, or if no channel is set up at all (output only)."""
+    print(f"\n>>> {title}\n    {message.replace(chr(10), chr(10) + '    ')}\n")
+    if args.desktop:
+        desktop_alert(title, message.split("\n")[0])
+
+    results = []
+    if telegram_configured(args):
+        results.append(send_telegram(args, title, message, priority))
+    if args.topic:
+        results.append(send_ntfy(args, title, message, priority, tags))
+    if not results:
+        print("  (no Telegram or ntfy set up, so nothing sent to your phone)")
+        return True
+    return any(results)
+
+
+def run_telegram_setup(args):
+    """Lists the chats that have messaged the bot, so you can copy your chat ID."""
+    if not args.telegram_token:
+        print("Add your bot token first (the TELEGRAM_BOT_TOKEN secret, or --telegram-token).")
+        return 1
+    try:
+        req = urllib.request.Request(f"{TELEGRAM_API}/bot{args.telegram_token}/getUpdates")
+        with urllib.request.urlopen(req, timeout=20) as res:
+            data = json.loads(res.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        print(f"!! Telegram said HTTP {e.code}. Is the bot token complete and correct?")
+        return 1
+    except Exception as e:
+        print(f"!! could not reach Telegram: {type(e).__name__}")
+        return 1
+
+    chats = {}
+    for update in data.get("result", []):
+        msg = update.get("message") or update.get("edited_message") or {}
+        chat = msg.get("chat") or {}
+        if "id" in chat:
+            who = " ".join(filter(None, [chat.get("first_name"), chat.get("last_name")])) or chat.get("title") or ""
+            if chat.get("username"):
+                who += f" (@{chat['username']})"
+            chats[chat["id"]] = who.strip()
+
+    if not chats:
+        print("No messages found. Open your bot in Telegram, press Start (or send it any message),")
+        print("then run this again within 24 hours.")
+        return 1
+
+    lines = [f"Chat ID {cid}  <- {who}" for cid, who in chats.items()]
+    print("\n".join(lines))
+    print("\nCopy the number into a GitHub secret called TELEGRAM_CHAT_ID.")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write("### Your Telegram chat ID\n\n")
+            for cid, who in chats.items():
+                f.write(f"- **{cid}** ({who})\n")
+            f.write("\nCopy this number into a repository secret called `TELEGRAM_CHAT_ID`.\n")
+    return 0
 
 
 # --- Remembering what we already told you ---------------------------------------------
@@ -318,7 +405,7 @@ def check_once(args, state):
 
     if open_now and not state.get("open"):
         if push(args, f"White Horse Hill: {nights_txt} is AVAILABLE",
-                f"Book it now, before someone else does. Tap to open DOC bookings.\n{counts_txt}",
+                f"Book it now, before someone else does: use the Open DOC booking button.\n{counts_txt}",
                 priority=5, tags=["rotating_light", "camping"]):
             state["open"] = True
             state["notified_at"] = now_utc().isoformat()
@@ -328,7 +415,7 @@ def check_once(args, state):
         minutes = (now_utc() - dt.datetime.fromisoformat(last)).total_seconds() / 60 if last else 1e9
         if minutes >= args.remind_minutes:
             if push(args, f"Still open: White Horse Hill {nights_txt}",
-                    f"Still bookable after {int(minutes)} min. Tap to open DOC bookings.\n{counts_txt}",
+                    f"Still bookable after {int(minutes)} min: use the Open DOC booking button.\n{counts_txt}",
                     priority=4, tags=["camping"]):
                 state["notified_at"] = now_utc().isoformat()
         else:
@@ -369,12 +456,20 @@ def run_check_only(args):
 
 
 def run_test_notify(args):
-    if not args.topic:
-        print("Set your ntfy topic first: --topic YOUR-TOPIC (or the NTFY_TOPIC variable).")
+    if args.telegram_token and not args.telegram_chat:
+        print("Telegram: bot token found but no TELEGRAM_CHAT_ID yet. Run the telegram-setup mode first.")
+    if not telegram_configured(args) and not args.topic:
+        print("Set up Telegram (TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID) or ntfy (NTFY_TOPIC) first.")
         return 1
-    ok = push(args, "Test: White Horse Hill tracker",
-              "If you can read this on your phone, alerts work. Tapping it opens the DOC booking page.",
-              priority=4, tags=["camping"])
+    title = "Test: White Horse Hill tracker"
+    message = "If you can read this on your phone, alerts work. The button opens the DOC booking page."
+    print(f"\n>>> {title}\n")
+    # Test each channel on its own, so a broken one turns the run red.
+    ok = True
+    if telegram_configured(args):
+        ok = send_telegram(args, title, message, 4) and ok
+    if args.topic:
+        ok = send_ntfy(args, title, message, 4, ["camping"]) and ok
     return 0 if ok else 1
 
 
@@ -402,6 +497,10 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Watch DOC's White Horse Hill Campsite for an opening and push-alert your phone.")
     p.add_argument("--nights", default=os.environ.get("WANTED_NIGHTS") or DEFAULT_NIGHTS,
                    help="night(s) you need, as arrival dates, comma separated (default: %(default)s)")
+    p.add_argument("--telegram-token", default=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+                   help="your Telegram bot token (from @BotFather)")
+    p.add_argument("--telegram-chat", default=os.environ.get("TELEGRAM_CHAT_ID", ""),
+                   help="your Telegram chat ID (find it with --telegram-setup)")
     p.add_argument("--topic", default=os.environ.get("NTFY_TOPIC", ""),
                    help="your ntfy topic (the name you subscribed to in the ntfy app)")
     p.add_argument("--min-people", type=int, default=int(os.environ.get("MIN_PEOPLE") or 1),
@@ -413,7 +512,9 @@ def parse_args(argv=None):
                    help="while it stays open, remind every N minutes (0 = off, default: 30)")
     p.add_argument("--desktop", action="store_true", help="also beep and show a popup on this computer")
     p.add_argument("--check", action="store_true", help="just show current availability and exit (no alerts)")
-    p.add_argument("--test-notify", action="store_true", help="send a test push to your phone and exit")
+    p.add_argument("--test-notify", action="store_true", help="send a test alert to your phone and exit")
+    p.add_argument("--telegram-setup", action="store_true",
+                   help="show the chat ID of whoever messaged your bot, and exit")
     args = p.parse_args(argv)
 
     nights = [n.strip() for n in args.nights.split(",") if n.strip()]
@@ -426,6 +527,8 @@ def parse_args(argv=None):
     if not args.nights:
         p.error("give at least one night to watch")
     args.topic = args.topic.strip()
+    args.telegram_token = args.telegram_token.strip()
+    args.telegram_chat = args.telegram_chat.strip()
     return args
 
 
@@ -436,6 +539,8 @@ def main(argv=None):
             return run_check_only(args)
         if args.test_notify:
             return run_test_notify(args)
+        if args.telegram_setup:
+            return run_telegram_setup(args)
         return run_watch(args)
     except KeyboardInterrupt:
         print("\nStopped.")
