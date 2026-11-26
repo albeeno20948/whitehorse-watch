@@ -1,0 +1,52 @@
+name: White Horse Hill watch
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub often runs scheduled jobs a few minutes late at busy
+    # times, so in practice expect a check every 5-15 minutes.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to run"
+        type: choice
+        options: [check, test-notify, watch]
+        default: check
+
+permissions:
+  contents: write   # to save state.json, so you are not alerted twice for one opening
+
+concurrency:
+  group: whitehorse-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # The night(s) you still need, as arrival dates, comma separated.
+      WANTED_NIGHTS: "2027-01-22"
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      MODE: ${{ inputs.mode || 'watch' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check DOC availability
+        run: |
+          case "$MODE" in
+            check)       python3 whitehorse_watch.py --check ;;
+            test-notify) python3 whitehorse_watch.py --test-notify ;;
+            *)           python3 whitehorse_watch.py --state state.json ;;
+          esac
+
+      - name: Save state (only when it changed)
+        if: env.MODE == 'watch'
+        run: |
+          if [ -n "$(git status --porcelain -- state.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "Update tracker state"
+            git push
+          fi
