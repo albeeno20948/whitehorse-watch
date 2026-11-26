@@ -10,7 +10,7 @@ on:
       mode:
         description: "What to run"
         type: choice
-        options: [check, test-notify, watch]
+        options: [check, test-notify, telegram-setup, watch]
         default: check
 
 permissions:
@@ -27,6 +27,8 @@ jobs:
     env:
       # The night(s) you still need, as arrival dates, comma separated.
       WANTED_NIGHTS: "2027-01-22"
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
       MODE: ${{ inputs.mode || 'watch' }}
     steps:
@@ -35,9 +37,10 @@ jobs:
       - name: Check DOC availability
         run: |
           case "$MODE" in
-            check)       python3 whitehorse_watch.py --check ;;
-            test-notify) python3 whitehorse_watch.py --test-notify ;;
-            *)           python3 whitehorse_watch.py --state state.json ;;
+            check)          python3 whitehorse_watch.py --check ;;
+            test-notify)    python3 whitehorse_watch.py --test-notify ;;
+            telegram-setup) python3 whitehorse_watch.py --telegram-setup ;;
+            *)              python3 whitehorse_watch.py --state state.json ;;
           esac
 
       - name: Save state (only when it changed)
